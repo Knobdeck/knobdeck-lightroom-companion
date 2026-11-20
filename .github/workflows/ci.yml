@@ -1,0 +1,55 @@
+name: CI
+
+# Pushes to master run this through the Release workflow (release.yml), not on their own.
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      plugins_ref:
+        description: knobdeck-plugins branch or tag to test against
+        default: master
+  workflow_call:
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lua 5.1 (Lightroom's) and LuaJIT
+        run: sudo apt-get update -q && sudo apt-get install -yq lua5.1 luajit
+      - name: Syntax
+        run: for f in KnobDeck.lrplugin/*.lua tests/*.lua; do luac5.1 -p "$f"; done
+      - name: Unit tests, Lua 5.1
+        run: lua5.1 tests/run.lua
+      - name: Unit tests, LuaJIT
+        run: luajit tests/run.lua
+      - name: Build the zip
+        run: python3 tools/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: knobdeck-lightroom-companion
+          path: dist/KnobDeck.lrplugin.zip
+
+  e2e:
+    name: End to end with the plugin
+    needs: lua
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The KnobDeck lightroom-classic plugin, built from source, so the test drives the real thing.
+      # (It ships for Windows and macOS; its link code is the same on Linux.)
+      - uses: actions/checkout@v4
+        with:
+          repository: Knobdeck/knobdeck-plugins
+          ref: ${{ inputs.plugins_ref || 'master' }}
+          path: knobdeck-plugins
+      - run: sudo apt-get update -q && sudo apt-get install -yq lua5.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: knobdeck-plugins
+      - name: Build the KnobDeck lightroom-classic plugin
+        working-directory: knobdeck-plugins
+        run: cargo build --release -p lightroom-classic --bin lightroom-classic
+      - name: End to end
+        run: python3 tests/e2e_plugin.py knobdeck-plugins/target/release/lightroom-classic

@@ -1,0 +1,76 @@
+# Every push to master runs this. When the version in KnobDeck.lrplugin/Info.lua has no release
+# yet, it runs CI, then creates the tag v<version> and a GitHub release with KnobDeck.lrplugin.zip
+# (the name KnobDeck's setup downloads from releases/latest/download/). A push that doesn't bump
+# the version only runs CI. No store: Lightroom plug-ins install from the zip (an Adobe Exchange
+# listing is a later TODO).
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency: release
+
+jobs:
+  ci:
+    if: github.ref == 'refs/heads/master'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # tag and GitHub release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      published: ${{ steps.tag.outputs.published }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "version=$(python3 tools/build.py --version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: knobdeck-lightroom-companion
+          path: dist
+      - name: Tag and GitHub release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::$tag is already released; bump VERSION in KnobDeck.lrplugin/Info.lua to ship this push"
+            exit 0
+          fi
+          awk '/^## /{n++} n==1' CHANGELOG.md | tail -n +2 > notes.md
+          gh release create "$tag" dist/KnobDeck.lrplugin.zip --target "$GITHUB_SHA" \
+            --title "KnobDeck plug-in for Lightroom Classic $VERSION" --notes-file notes.md --latest
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+  catalog:
+    # Tells the knobdeck-registry catalog to rebuild. Skipped until the catalog GitHub App is set up
+    # (CATALOG_APP_ID variable, CATALOG_APP_PRIVATE_KEY secret).
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Catalog app token
+        id: app
+        if: vars.CATALOG_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CATALOG_APP_ID }}
+          private-key: ${{ secrets.CATALOG_APP_PRIVATE_KEY }}
+          owner: Knobdeck
+          repositories: knobdeck-registry
+      - name: Tell the catalog
+        if: steps.app.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          jq -n --arg repo "$GITHUB_REPOSITORY" --arg id "lightroom" --arg version "$VERSION" \
+            '{event_type: "companion-released", client_payload: {repo: $repo, id: $id, version: $version}}' |
+            gh api repos/Knobdeck/knobdeck-registry/dispatches --input -
